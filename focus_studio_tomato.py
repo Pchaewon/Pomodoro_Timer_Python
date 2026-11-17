@@ -358,6 +358,7 @@ class TomatoFocus:
         self.drag_start = None
         self.meeting_filter = "upcoming"
         self.meeting_popups = []
+        self.break_popup = None
         self.meeting_list = self.meeting_next = self.meeting_next_detail = None
         self.mini_meeting_label = None
         self.meeting_view_key = None
@@ -471,7 +472,7 @@ class TomatoFocus:
 
     def clear_widgets(self):
         for child in self.root.winfo_children():
-            if child not in self.meeting_popups: child.destroy()
+            if child not in self.meeting_popups and child is not self.break_popup: child.destroy()
         self.summary_value = {}
         self.timer_label = self.primary_button = self.status_label = self.cycle_canvas = None
         self.scene = self.task_area = self.entry = self.task_scroll = None
@@ -902,7 +903,7 @@ class TomatoFocus:
         self.running=True
         self.deadline=time.monotonic()+self.remaining
         self._schedule_tick()
-        self.status="집중 중! 지금 하는 일 하나에만 마음을 모아요."
+        self.status="집중 중! 지금 하는 일 하나에만 마음을 모아요." if self.mode=="focus" else "휴식 중! 편하게 쉬어 가세요."
         self.refresh()
 
     def pause_timer(self):
@@ -982,6 +983,85 @@ class TomatoFocus:
         self.refresh()
         if old=="focus" and self.settings["auto_break"]:
             self.start_timer()
+        if old=="focus":
+            self.show_break_alert()
+
+    def show_break_alert(self):
+        """One persistent, non-modal celebration; animation stops after 2.4 seconds."""
+        if self.break_popup is not None:
+            self.break_popup.destroy()
+        dlg = tk.Toplevel(self.root)
+        self.break_popup = dlg
+        dlg.title("Tomato Focus · 휴식 시간")
+        dlg.configure(bg=P["bg"])
+        dlg.resizable(False, False)
+        dlg.attributes("-topmost", True)
+        wrap = tk.Frame(dlg, bg=P["bg"], padx=22, pady=18)
+        wrap.pack(fill="both", expand=True)
+        cv = tk.Canvas(wrap, width=340, height=156, bg=P["bg"], highlightthickness=0)
+        cv.pack()
+        draw_tomato(cv, 170, 82, 2.0)
+        self.label(wrap, "토마토 수확 완료!", size=20, weight="bold", color="red").pack(pady=(6, 4))
+        self.label(wrap, "이제 잠깐 쉬어갈 시간이에요.", size=12).pack()
+        mode = self.mode
+        minutes = self.settings[mode]
+        self.label(wrap, f"{'긴 휴식' if mode == 'long' else '짧은 휴식'} · {minutes}분", size=11, color="muted").pack(pady=10)
+        job = None
+        def cleanup(event=None):
+            nonlocal job
+            if event is not None and event.widget is not dlg: return
+            if job is not None:
+                try: self.root.after_cancel(job)
+                except tk.TclError: pass
+                job = None
+            if self.break_popup is dlg: self.break_popup = None
+        def dismiss(start=False):
+            if start and self.mode == mode and not self.running:
+                self.start_timer()
+            cleanup()
+            dlg.destroy()
+        bar = tk.Frame(wrap, bg=P["bg"])
+        bar.pack(fill="x", pady=(8, 0))
+        self.btn(bar, "닫기", dismiss, width=150, border="line").pack(side="left", expand=True)
+        self.btn(bar, "확인" if self.running else "휴식 시작", (dismiss if self.running else lambda: dismiss(True)), width=170, fill="red", fg="on_accent").pack(side="right", expand=True)
+        dlg.protocol("WM_DELETE_WINDOW", dismiss)
+        dlg.bind("<Escape>", lambda e: dismiss())
+        dlg.bind("<Destroy>", cleanup, add="+")
+        dlg.update_idletasks()
+        w, h = dlg.winfo_reqwidth(), dlg.winfo_reqheight()
+        dlg.geometry(f"{w}x{h}+{max(0,(dlg.winfo_screenwidth()-w)//2)}+{max(0,(dlg.winfo_screenheight()-h)//2)}")
+        dlg.lift()
+        rng = random.Random()
+        particles = []
+        for i in range(24):
+            x = rng.choice((62, 278)); y = 105
+            vx = rng.uniform(-65, 65); vy = rng.uniform(-145, -65)
+            if i % 3 == 0:
+                draw_tomato(cv, x, y, rng.uniform(.23,.38), speckles=False)
+                # Tag the newly created tomato shapes as one moving particle.
+                ids = cv.find_all()[-3:]
+            else:
+                color = rng.choice((P["red"], P["green"], "#F5B65D", "#F68B78"))
+                ids = (cv.create_rectangle(x,y,x+5,y+9,fill=color,outline=""),)
+            particles.append((ids,vx,vy))
+        started = time.monotonic()
+        last = 0.0
+        def animate():
+            nonlocal job, last
+            job = None
+            t = min(2.4, time.monotonic()-started)
+            dt = t-last
+            for ids,vx,vy in particles:
+                for item in ids:
+                    cv.move(item,vx*dt,vy*dt+85*(t*t-last*last))
+            last = t
+            if t < 2.4 and not self._closing:
+                job = self.root.after(40, animate)
+            else:
+                for ids, _, _ in particles:
+                    for item in ids: cv.delete(item)
+                particles.clear()
+        animate()
 
     def report_callback_exception(self, exc_type, exc_value, exc_traceback):
         LOGGER.error("Tk callback error", exc_info=(exc_type, exc_value, exc_traceback))
