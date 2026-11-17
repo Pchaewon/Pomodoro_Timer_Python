@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Tomato Focus — Tkinter Pomodoro, To-do and week/month/year focus dashboard.
+"""Tomato Focus — Tkinter Pomodoro, To-do, meeting reminders and week/month/year focus dashboard.
 
 Standalone: Python 3.9+ and the standard library only.
 Light/dark theme: use the moon/sun toggle or Settings > 화면 테마.
@@ -20,6 +20,8 @@ import calendar
 import ctypes
 from datetime import date, datetime, timedelta
 import json
+import logging
+from logging.handlers import RotatingFileHandler
 import math
 from pathlib import Path
 import random
@@ -31,6 +33,25 @@ import uuid
 
 APP_NAME = "Tomato Focus"
 DATA_PATH = Path.home() / ".focus_studio" / "state.json"
+LOG_PATH = DATA_PATH.with_name("tomato_focus.log")
+LOGGER = logging.getLogger("tomato_focus")
+
+
+def configure_logging():
+    """Bounded diagnostic log, including windowed EXE callback errors."""
+    if LOGGER.handlers:
+        return
+    LOGGER.setLevel(logging.INFO)
+    LOGGER.propagate = False
+    try:
+        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        handler = RotatingFileHandler(LOG_PATH, maxBytes=256 * 1024,
+                                      backupCount=1, encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        LOGGER.addHandler(handler)
+    except OSError:
+        LOGGER.addHandler(logging.NullHandler())
+
 
 # Theme colors are semantic: "white" means card/background surface, not literal white.
 # Widgets read from the same mutable dict and get rebuilt after a theme change.
@@ -75,6 +96,7 @@ DEFAULT_SETTINGS = {
     "always_on_top": False,         # Full dashboard only
     "mini_always_on_top": True,     # Floating widget: ON by default
     "auto_break": False,
+    "prevent_sleep": True,     # Windows only: prevent automatic system sleep, not display-off
     "theme": "light",          # "light" / "dark", persisted across launches
 }
 MODE_TITLE = {"focus": "몰입 시간", "short": "짧은 휴식", "long": "긴 휴식"}
@@ -83,12 +105,17 @@ DAY_KO = ["월", "화", "수", "목", "금", "토", "일"]
 
 
 def font_family(root):
+    root = root._root()
+    if getattr(root, "_tomato_font_family", None):
+        return root._tomato_font_family
     families = set(tkfont.families(root))
     for f in ("Pretendard", "맑은 고딕", "Malgun Gothic", "Apple SD Gothic Neo",
               "Noto Sans CJK KR", "Segoe UI", "DejaVu Sans"):
         if f in families:
+            root._tomato_font_family = f
             return f
-    return "TkDefaultFont"
+    root._tomato_font_family = "TkDefaultFont"
+    return root._tomato_font_family
 
 
 def rounded_rect(cv, x1, y1, x2, y2, r=16, *, fill, outline="", width=1, tags=()):
@@ -147,6 +174,7 @@ class Pill(tk.Canvas):
         self.draw()
 
     def set(self, *, text=None, fill=None, fg=None):
+        old = (self.text, self.fill, self.fg, self.hover)
         if text is not None:
             self.text = text
         if fill is not None:
@@ -156,7 +184,8 @@ class Pill(tk.Canvas):
             self.fill = new_fill
         if fg is not None:
             self.fg = P.get(fg, fg)
-        self.draw()
+        if old != (self.text, self.fill, self.fg, self.hover):
+            self.draw()
 
     def draw(self):
         self.delete("all")
@@ -272,10 +301,23 @@ class TomatoFocus:
         self.demo = demo
         self.screenshot = screenshot
         self.font_name = font_family(root)
+        self.done_font = tkfont.Font(root=root, family=self.font_name, size=10, overstrike=True)
+        self._closing = False
+        self._tick_after = self._meeting_after = self._topmost_after = None
+        self._sleep_active = False
+        self._task_render_key = None
+        self._meeting_summary_key = None
+        self._stats_cache = None
+        self._session_revision = 0
+        self._last_day = date.today()
+        self.root.report_callback_exception = self.report_callback_exception
         self.state = self.load()
         if demo:
             self.add_demo_content()
         self.settings = self.state["settings"]
+        self._daily_stats = {}
+        for session in self.state["sessions"]:
+            self._index_session(session)
         apply_palette(self.settings.get("theme", "light"))
         self.mode = "focus"
         self.page = "focus"
@@ -314,6 +356,11 @@ class TomatoFocus:
         self.mini_pin = None
         self.mini_task_label = None
         self.drag_start = None
+        self.meeting_filter = "upcoming"
+        self.meeting_popups = []
+        self.meeting_list = self.meeting_next = self.meeting_next_detail = None
+        self.mini_meeting_label = None
+        self.meeting_view_key = None
         self.full_geometry = "1100x835"
         self.root.title(APP_NAME)
         self.root.configure(bg=P["bg"])
@@ -321,13 +368,18 @@ class TomatoFocus:
         self.root.bind("<space>", self.spacebar)
         self.root.bind("<Control-n>", self.quick_add)
         self.root.bind("<Control-m>", lambda e: self.toggle_mini())
+        self.root.bind("<Control-e>", self.open_meetings)
+        self.root.bind("<Control-q>", self.close)
         self.root.bind("<Escape>", lambda e: self.toggle_mini() if self.compact else None)
         self.root.geometry(self.full_geometry)
         self.root.minsize(900, 720)
         self.root.resizable(True, True)
         self.build()
-        self.root.after(200, self.tick)
+        self._schedule_tick()
+        self._meeting_after = self.root.after(250, self.meeting_tick)
         self.apply_topmost()
+        self.apply_sleep_policy()
+        LOGGER.info("Started (demo=%s, theme=%s)", self.demo, self.settings["theme"])
         if screenshot:
             # Only used for optional development previews. Pillow is not needed to run the app.
             self.root.after(850, lambda: self.capture(screenshot))
@@ -335,7 +387,7 @@ class TomatoFocus:
     @staticmethod
     def fresh_state():
         return {"tasks": [], "sessions": [], "settings": dict(DEFAULT_SETTINGS),
-                "active_task": None, "window": {}}
+                "active_task": None, "window": {}, "meetings": []}
 
     def load(self):
         state = self.fresh_state()
@@ -345,6 +397,15 @@ class TomatoFocus:
                 return state
             state["tasks"] = [x for x in existing.get("tasks", []) if isinstance(x, dict)] if isinstance(existing.get("tasks", []), list) else []
             state["sessions"] = [x for x in existing.get("sessions", []) if isinstance(x, dict)] if isinstance(existing.get("sessions", []), list) else []
+            meetings = existing.get("meetings", [])
+            if isinstance(meetings, list):
+                for item in meetings:
+                    if not isinstance(item, dict) or not self.meeting_time(item): continue
+                    if not isinstance(item.get("title"), str) or not item["title"].strip(): continue
+                    if item.get("remind_minutes") not in (10, 15): continue
+                    state["meetings"].append({"id": str(item.get("id") or uuid.uuid4().hex),
+                                              "title": item["title"], "start_at": self.meeting_time(item).isoformat(timespec="minutes"),
+                                              "remind_minutes": int(item["remind_minutes"]), "notified": item.get("notified") is True})
             state["active_task"] = existing.get("active_task")
             state["window"] = existing.get("window", {}) if isinstance(existing.get("window", {}), dict) else {}
             old = existing.get("settings", {})
@@ -371,6 +432,11 @@ class TomatoFocus:
             for i,title in enumerate(tasks)
         ]
         self.state["active_task"] = "demo-1"
+        future = (datetime.now()+timedelta(hours=1)).replace(second=0, microsecond=0)
+        self.state["meetings"] = [
+            {"id": "demo-meeting-1", "title": "프로젝트 진행 현황 리뷰", "start_at": future.isoformat(timespec="minutes"), "remind_minutes": 10, "notified": False},
+            {"id": "demo-meeting-2", "title": "팀 주간 회의", "start_at": (future+timedelta(days=1)).isoformat(timespec="minutes"), "remind_minutes": 15, "notified": False},
+        ]
         rng = random.Random(30)
         self.state["sessions"] = []
         for i in range(185):
@@ -387,10 +453,12 @@ class TomatoFocus:
         try:
             DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
             temp = DATA_PATH.with_suffix(".tmp")
-            temp.write_text(json.dumps(self.state, ensure_ascii=False, indent=2), encoding="utf-8")
+            with temp.open("w", encoding="utf-8") as stream:
+                json.dump(self.state, stream, ensure_ascii=False, indent=2)
             temp.replace(DATA_PATH)
         except OSError as e:
             self.status = f"저장하지 못했습니다: {e}"
+            LOGGER.exception("State save failed")
 
     def label(self, parent, text, *, size=11, color="text", weight="normal", bg=None, **kw):
         return tk.Label(parent, text=text, bg=bg or parent.cget("bg"), fg=P.get(color, color),
@@ -403,7 +471,7 @@ class TomatoFocus:
 
     def clear_widgets(self):
         for child in self.root.winfo_children():
-            child.destroy()
+            if child not in self.meeting_popups: child.destroy()
         self.summary_value = {}
         self.timer_label = self.primary_button = self.status_label = self.cycle_canvas = None
         self.scene = self.task_area = self.entry = self.task_scroll = None
@@ -411,6 +479,13 @@ class TomatoFocus:
         self.chart_canvas = self.heat_canvas = self.period_caption = self.stats_info = None
         self.stats_summary = {}
         self.mini_pin = self.mini_task_label = None
+        self.meeting_list = self.meeting_next = self.meeting_next_detail = None
+        self.mini_meeting_label = None
+        self.meeting_view_key = None
+        self._task_render_key = self._meeting_summary_key = None
+        self.current_task = self.task_count = self.scroll_window = None
+        self.task_filter_buttons = self.meeting_filter_buttons = {}
+        self.meeting_canvas = self.meeting_wheel = None
 
     def build(self):
         self.clear_widgets()
@@ -438,12 +513,12 @@ class TomatoFocus:
         self.label(titlebox,"FOCUS  ·  나만의 몰입 공간",size=9,color="muted").pack(anchor="w")
         right=tk.Frame(hdr,bg=P["bg"])
         right.pack(side="right")
-        self.btn(right,"⚙ 설정",self.settings_dialog,width=94,height=37,fill="white",border="line").pack(side="right",padx=(8,0))
+        self.btn(right,"⚙ 설정",self.settings_dialog,width=74,height=37,fill="white",border="line").pack(side="right",padx=(8,0))
         self.btn(right,"☾ 다크" if self.settings["theme"] == "light" else "☀ 라이트",
-                 self.toggle_theme,width=94,height=37,fill="surface",fg="text",border="line").pack(side="right",padx=(8,0))
-        self.btn(right,"▣ 미니 위젯",self.toggle_mini,width=121,height=37,fill="red",fg="on_accent",hover="red_dark").pack(side="right",padx=(8,0))
-        for pg,name in (("focus","집중 · 할 일"),("stats","몰입 통계")):
-            b = self.btn(right,name,lambda p=pg:self.switch_page(p),width=119,height=37,
+                 self.toggle_theme,width=76,height=37,fill="surface",fg="text",border="line").pack(side="right",padx=(8,0))
+        self.btn(right,"▣ 미니 위젯",self.toggle_mini,width=106,height=37,fill="red",fg="on_accent",hover="red_dark").pack(side="right",padx=(8,0))
+        for pg,name in (("focus","집중 · 할 일"),("stats","몰입 통계"),("meetings","회의")):
+            b = self.btn(right,name,lambda p=pg:self.switch_page(p),width=99 if pg!="meetings" else 70,height=37,
                          fill="red_pale" if pg==self.page else "white",
                          fg="red" if pg==self.page else "muted",
                          border=None if pg==self.page else "line")
@@ -451,13 +526,15 @@ class TomatoFocus:
             self.nav_buttons[pg]=b
         if self.page=="focus":
             self.build_dashboard(shell)
-        else:
+        elif self.page=="stats":
             self.build_statistics(shell)
+        else:
+            self.build_meetings(shell)
         foot=tk.Frame(shell,bg=P["bg"])
         foot.pack(fill="x",pady=(10,0))
         self.status_label=self.label(foot,"",size=9,color="muted")
         self.status_label.pack(side="left")
-        self.label(foot,"SPACE 시작/멈춤  ·  CTRL+N 할 일  ·  CTRL+M 미니 위젯",
+        self.label(foot,"SPACE 시작/멈춤  ·  CTRL+N 할 일  ·  CTRL+M 미니  ·  CTRL+E 회의",
                    size=9,color="hint").pack(side="right")
 
     def build_dashboard(self, shell):
@@ -503,8 +580,8 @@ class TomatoFocus:
             x=max(0,self.root.winfo_screenwidth()-345)
             y=64
         x=max(0,min(x,max(0,self.root.winfo_screenwidth()-320)))
-        y=max(0,min(y,max(0,self.root.winfo_screenheight()-435)))
-        self.root.geometry(f"320x430+{x}+{y}")
+        y=max(0,min(y,max(0,self.root.winfo_screenheight()-463)))
+        self.root.geometry(f"320x458+{x}+{y}")
         outer=tk.Frame(self.root,bg=P["shadow"],padx=1,pady=1)
         outer.pack(fill="both",expand=True)
         panel=tk.Frame(outer,bg=P["white"],padx=16,pady=10)
@@ -531,6 +608,9 @@ class TomatoFocus:
         self.build_timer(panel,mini=True)
         self.mini_task_label=self.label(panel,"",size=9,color="muted",anchor="center")
         self.mini_task_label.pack(fill="x",pady=(4,0))
+        self.mini_meeting_label = self.label(panel, "", size=9, color="red", anchor="center", cursor="hand2")
+        self.mini_meeting_label.pack(fill="x", pady=(4,0))
+        self.mini_meeting_label.bind("<Button-1>", self.open_meetings)
 
     def build_timer(self, parent,mini):
         modebar=tk.Frame(parent,bg=parent.cget("bg"))
@@ -700,6 +780,12 @@ class TomatoFocus:
 
     def render_tasks(self):
         if self.task_area is None:return
+        # Rebuild only when task data, selection or filter actually changes.
+        key=(self.filter_name, self.active_task, tuple(
+            (t.get("id"), t.get("title"), bool(t.get("done")), bool(t.get("priority")))
+            for t in self.state["tasks"]))
+        if key == self._task_render_key:return
+        self._task_render_key=key
         for child in self.task_area.winfo_children():child.destroy()
         for key,button in self.task_filter_buttons.items():
             on=key==self.filter_name
@@ -725,8 +811,7 @@ class TomatoFocus:
                             bg=bg,anchor="w",cursor="hand2")
             text.pack(side="left",fill="x",expand=True,padx=(3,1))
             if done:
-                f=tkfont.Font(family=self.font_name,size=10,overstrike=True)
-                text.config(font=f);text._preserved_font=f
+                text.config(font=self.done_font)
             text.bind("<Button-1>",lambda e,i=tid:self.choose_task(i))
             self.btn(r,"★" if t.get("priority") else "☆",lambda i=tid:self.priority_task(i),
                      width=30,height=31,fill=bg,fg="orange" if t.get("priority") else "hint",size=12).pack(side="right")
@@ -748,21 +833,28 @@ class TomatoFocus:
         except (ValueError,TypeError):
             return 0
 
+    def _index_session(self, session):
+        """One small aggregate per calendar day; no repeated full-history scan."""
+        key = session.get("date")
+        try:
+            date.fromisoformat(key)
+        except (ValueError, TypeError):
+            return
+        agg = self._daily_stats.setdefault(key, [0, 0, 0, 0])
+        agg[0] += self.mins(session.get("minutes", 0))
+        agg[1] += 1
+        if type(session.get("pause_count")) is int:
+            agg[2] += 1
+            agg[3] += int(session["pause_count"] == 0)
+        self._session_revision += 1
+        self._stats_cache = None
+
     def date_totals(self):
-        totals={}
-        for s in self.state["sessions"]:
-            key=s.get("date")
-            try:
-                date.fromisoformat(key)
-            except (ValueError,TypeError):
-                continue
-            totals[key]=totals.get(key,0)+self.mins(s.get("minutes",0))
-        return totals
+        return {day: agg[0] for day, agg in self._daily_stats.items()}
 
     def today_totals(self):
-        today=date.today().isoformat()
-        sessions=[s for s in self.state["sessions"] if s.get("date")==today]
-        return sum(self.mins(s.get("minutes",0)) for s in sessions),len(sessions)
+        agg = self._daily_stats.get(date.today().isoformat(), (0, 0, 0, 0))
+        return agg[0], agg[1]
 
     def refresh(self):
         if self.timer_label is not None:
@@ -793,6 +885,7 @@ class TomatoFocus:
             self.render_tasks()
         if self.page=="stats" and not self.compact:
             self.update_stats()
+        self.update_meeting_summary()
 
     def toggle_timer(self):
         if self.running:self.pause_timer()
@@ -808,6 +901,7 @@ class TomatoFocus:
             self.focus_started_at=datetime.now().isoformat(timespec="seconds")
         self.running=True
         self.deadline=time.monotonic()+self.remaining
+        self._schedule_tick()
         self.status="집중 중! 지금 하는 일 하나에만 마음을 모아요."
         self.refresh()
 
@@ -858,7 +952,7 @@ class TomatoFocus:
         self.running=False
         self.deadline=None
         if old=="focus":
-            self.state["sessions"].append({
+            session = {
                 "date":date.today().isoformat(),
                 "minutes":self.settings["focus"],
                 "mode":"focus",
@@ -868,7 +962,9 @@ class TomatoFocus:
                 "finished_at":datetime.now().isoformat(timespec="seconds"),
                 "pause_count":self.pause_count,
                 "pause_seconds":round(self.pause_total),
-            })
+            }
+            self.state["sessions"].append(session)
+            self._index_session(session)
             self.focus_cycle+=1
             if self.focus_cycle>=self.settings["long_every"]:
                 self.focus_cycle=0
@@ -887,8 +983,33 @@ class TomatoFocus:
         if old=="focus" and self.settings["auto_break"]:
             self.start_timer()
 
+    def report_callback_exception(self, exc_type, exc_value, exc_traceback):
+        LOGGER.error("Tk callback error", exc_info=(exc_type, exc_value, exc_traceback))
+
+    def _cancel_after(self, attr):
+        job = getattr(self, attr, None)
+        setattr(self, attr, None)
+        if job is not None:
+            try:
+                self.root.after_cancel(job)
+            except tk.TclError:
+                pass
+
+    def _schedule_tick(self):
+        self._cancel_after("_tick_after")
+        if not self._closing:
+            # Idle timer needs no 5 Hz polling. During focus the monotonic deadline
+            # remains authoritative, so skipped UI frames do not lose elapsed time.
+            self._tick_after = self.root.after(250 if self.running else 5000, self.tick)
+
     def tick(self):
+        self._tick_after = None
+        if self._closing:return
         try:
+            today = date.today()
+            if today != self._last_day:
+                self._last_day = today
+                self.refresh()
             if self.running and self.deadline is not None:
                 new=max(0,math.ceil(self.deadline-time.monotonic()))
                 if new!=self.remaining:
@@ -897,14 +1018,317 @@ class TomatoFocus:
                         self.timer_label.config(text=f"{new//60:02d}:{new%60:02d}")
                 if self.remaining==0:
                     self.finish_session()
-            self.root.after(200,self.tick)
-        except tk.TclError:
-            pass
+        except Exception:
+            LOGGER.exception("Timer tick failed; retrying")
+        finally:
+            # finish_session may start an automatic break and schedule a tick;
+            # replacing the handle guarantees exactly one recurring timer.
+            if not self._closing:
+                self._schedule_tick()
 
     def switch_page(self,page):
         if self.compact or page==self.page:return
         self.page=page
         self.build()
+
+    # ───── Meetings: local schedule and one-time reminders ─────
+    @staticmethod
+    def meeting_time(meeting):
+        try:
+            value = datetime.fromisoformat(meeting.get("start_at", ""))
+            return value if value.tzinfo is None else None
+        except (TypeError, ValueError):
+            return None
+
+    def upcoming_meetings(self, now=None):
+        now = now or datetime.now()
+        upcoming = []
+        for m in self.state["meetings"]:
+            start = self.meeting_time(m)
+            if start is not None and start >= now:
+                upcoming.append((start, m))
+        upcoming.sort(key=lambda pair: pair[0])
+        return [m for _, m in upcoming]
+
+    def build_meetings(self, shell):
+        hero = tk.Frame(shell, bg=P["bg"])
+        hero.pack(fill="x", pady=(0, 13))
+        left = tk.Frame(hero, bg=P["bg"])
+        left.pack(side="left")
+        self.label(left, "다가오는 회의", size=20, weight="bold").pack(anchor="w")
+        self.label(left, "집중은 그대로, 회의 시작은 놓치지 않도록.", size=10, color="muted").pack(anchor="w", pady=(3, 0))
+        self.btn(hero, "+ 회의 추가", lambda: self.meeting_dialog(), width=125, height=42,
+                 fill="red", fg="on_accent", hover="red_dark").pack(side="right")
+        summary = WhiteCard(shell, padding=16, bg="surface")
+        summary.pack(fill="x", pady=(0, 12))
+        self.label(summary.body, "NEXT MEETING", size=10, color="red", weight="bold").pack(anchor="w")
+        self.meeting_next = self.label(summary.body, "", size=18, weight="bold", anchor="w", justify="left", wraplength=710)
+        self.meeting_next.pack(fill="x", pady=(4, 3))
+        self.meeting_next_detail = self.label(summary.body, "", size=10, color="muted", anchor="w")
+        self.meeting_next_detail.pack(fill="x")
+        card = WhiteCard(shell, padding=15)
+        card.pack(fill="both", expand=True)
+        header = tk.Frame(card.body, bg=P["white"])
+        header.pack(fill="x", pady=(0, 10))
+        self.label(header, "회의 일정", size=13, weight="bold").pack(side="left")
+        self.meeting_filter_buttons = {}
+        for key, caption in (("upcoming", "예정"), ("all", "전체")):
+            button = self.btn(header, caption, lambda k=key: self.set_meeting_filter(k),
+                              width=65, height=31, fill="surface", size=9)
+            button.pack(side="right", padx=(5, 0))
+            self.meeting_filter_buttons[key] = button
+        area = tk.Frame(card.body, bg=P["white"])
+        area.pack(fill="both", expand=True)
+        canvas = tk.Canvas(area, bg=P["white"], highlightthickness=0, bd=0)
+        scroll = tk.Scrollbar(area, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        self.meeting_list = tk.Frame(canvas, bg=P["white"])
+        item = canvas.create_window((0, 0), window=self.meeting_list, anchor="nw")
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(item, width=e.width))
+        self.meeting_list.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        self.meeting_canvas = canvas
+        def wheel(e):
+            if getattr(e, "num", 0) == 4: step = -1
+            elif getattr(e, "num", 0) == 5: step = 1
+            else: step = -1 if e.delta > 0 else 1
+            canvas.yview_scroll(step, "units")
+            return "break"
+        self.meeting_wheel = wheel
+        for widget in (canvas, self.meeting_list):
+            for event in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                widget.bind(event, wheel)
+        self.render_meetings()
+        self.label(shell, "알림은 Tomato Focus가 실행 중일 때 표시됩니다. 타이머는 자동 중단되지 않아요.",
+                   size=9, color="muted").pack(anchor="w", pady=(10, 0))
+
+    def set_meeting_filter(self, value):
+        self.meeting_filter = value
+        self.render_meetings()
+
+    def render_meetings(self):
+        if self.meeting_list is None or not self.meeting_list.winfo_exists(): return
+        now = datetime.now()
+        for key, btn in self.meeting_filter_buttons.items():
+            active = key == self.meeting_filter
+            btn.set(fill="red_pale" if active else "surface", fg="red" if active else "muted")
+        for item in self.meeting_list.winfo_children(): item.destroy()
+        meetings = self.upcoming_meetings(now)
+        if self.meeting_filter == "all":
+            past = sorted((m for m in self.state["meetings"] if self.meeting_time(m) and self.meeting_time(m) < now),
+                          key=self.meeting_time, reverse=True)
+            meetings += past
+        if not meetings:
+            self.label(self.meeting_list, "등록된 회의가 없어요. + 회의 추가로 일정을 등록하세요.",
+                       size=11, color="muted").pack(pady=45)
+        for m in meetings:
+            dt = self.meeting_time(m)
+            row = tk.Frame(self.meeting_list, bg=P["white"], highlightbackground=P["line"], highlightthickness=1, padx=13, pady=12)
+            row.pack(fill="x", pady=(0, 8))
+            stamp = tk.Frame(row, bg=P["surface"], padx=10, pady=6)
+            stamp.pack(side="left", padx=(0, 13))
+            self.label(stamp, f"{dt:%m.%d}", size=12, weight="bold", color="red").pack()
+            self.label(stamp, f"{dt:%H:%M}", size=10, color="muted").pack()
+            actions = tk.Frame(row, bg=P["white"])
+            actions.pack(side="right")
+            self.btn(actions, "수정", lambda item=m: self.meeting_dialog(item), width=56, height=31, fill="surface", size=9).pack(side="left", padx=(0, 5))
+            self.btn(actions, "삭제", lambda item=m: self.delete_meeting(item), width=56, height=31, fill="white", fg="muted", border="line", size=9).pack(side="left")
+            info = tk.Frame(row, bg=P["white"])
+            info.pack(side="left", fill="x", expand=True)
+            title = m["title"]
+            self.label(info, title if len(title) <= 42 else title[:41]+"…", size=12, weight="bold", anchor="w").pack(fill="x")
+            status = "시작 시간 경과" if dt < now else ("알림 표시 완료" if m.get("notified") else "알림 예정")
+            self.label(info, f"{dt:%Y.%m.%d} ({DAY_KO[dt.weekday()]})  ·  {m['remind_minutes']}분 전  ·  {status}",
+                       size=9, color="muted", anchor="w").pack(fill="x", pady=(3, 0))
+            for widget in (row, stamp, info, actions, *stamp.winfo_children(), *info.winfo_children()):
+                for event in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                    widget.bind(event, self.meeting_wheel)
+        self.meeting_view_key = (now.date(), tuple(m["id"] for m in self.upcoming_meetings(now)))
+        self.update_meeting_summary(now)
+
+    def update_meeting_summary(self, now=None, meetings=None):
+        if self.meeting_next is None and self.mini_meeting_label is None:return
+        now = now or datetime.now()
+        if meetings is None:
+            meetings = self.upcoming_meetings(now)
+        if meetings:
+            m = meetings[0]
+            dt = self.meeting_time(m)
+            minutes = max(0, math.ceil((dt-now).total_seconds()/60))
+            left = (f"{minutes}분 후" if minutes < 60 else
+                    f"{minutes//60}시간 {minutes%60}분 후" if minutes < 1440 else f"{minutes//1440}일 후")
+            headline = m["title"]
+            detail = f"{dt:%m.%d} ({DAY_KO[dt.weekday()]}) {dt:%H:%M}  ·  {left}  ·  {m['remind_minutes']}분 전 알림"
+            mini = f"회의 {dt:%H:%M} · {left} · {headline[:12]}" if dt.date() == now.date() else f"다음 회의 {dt:%m.%d %H:%M}"
+        else:
+            headline, detail, mini = "예정된 회의 없음", "새 일정을 추가하면 시작 전에 알려드려요.", "예정된 회의 없음"
+        key = (headline, detail, mini)
+        if key == self._meeting_summary_key:return
+        self._meeting_summary_key = key
+        if self.meeting_next is not None:
+            self.meeting_next.configure(text=headline)
+            self.meeting_next_detail.configure(text=detail)
+        if self.mini_meeting_label is not None:
+            self.mini_meeting_label.configure(text=mini)
+
+    def open_meetings(self, _event=None):
+        if self.compact: self.toggle_mini()
+        self.switch_page("meetings")
+        return "break"
+
+    def meeting_dialog(self, meeting=None):
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Tomato Focus · 회의 " + ("수정" if meeting else "추가"))
+        dlg.configure(bg=P["bg"])
+        dlg.resizable(False, False)
+        dlg.transient(self.root)
+        dlg.grab_set()
+        wrap = tk.Frame(dlg, bg=P["bg"], padx=22, pady=20)
+        wrap.pack(fill="both", expand=True)
+        self.label(wrap, "회의 수정" if meeting else "새 회의 등록", size=17, weight="bold").pack(anchor="w")
+        self.label(wrap, "회의 시작 전에 토마토가 알려드려요.", size=10, color="muted").pack(anchor="w", pady=(3, 15))
+        dt = self.meeting_time(meeting) if meeting else (datetime.now() + timedelta(minutes=30)).replace(second=0, microsecond=0)
+        values = {"title": tk.StringVar(value=meeting["title"] if meeting else ""),
+                  "date": tk.StringVar(value=dt.strftime("%Y-%m-%d")),
+                  "time": tk.StringVar(value=dt.strftime("%H:%M"))}
+        widgets = {}
+        for key, cap in (("title", "회의 제목"), ("date", "날짜 (YYYY-MM-DD)"), ("time", "시작 시간 (24시간제 HH:MM)")):
+            self.label(wrap, cap, size=10, weight="bold").pack(anchor="w", pady=(0, 4))
+            entry = tk.Entry(wrap, textvariable=values[key], width=37, bg=P["white"], fg=P["text"], insertbackground=P["red"],
+                             font=(self.font_name, 11), relief="solid", bd=1, highlightbackground=P["line"])
+            entry.pack(fill="x", ipady=7, pady=(0, 12))
+            widgets[key] = entry
+        self.label(wrap, "알림 시점", size=10, weight="bold").pack(anchor="w", pady=(0, 6))
+        remind = tk.IntVar(value=meeting["remind_minutes"] if meeting else 10)
+        options = tk.Frame(wrap, bg=P["bg"])
+        options.pack(fill="x")
+        buttons = {}
+        def choose(n):
+            remind.set(n)
+            for k, button in buttons.items():
+                button.set(fill="red_pale" if k==n else "white", fg="red" if k==n else "muted")
+        for n in (10, 15):
+            b = self.btn(options, f"{n}분 전", lambda v=n: choose(v), width=150, height=36, border="line")
+            b.pack(side="left", fill="x", expand=True, padx=(0, 8) if n==10 else 0)
+            buttons[n] = b
+        choose(remind.get())
+        feedback = self.label(wrap, "", size=9, color="red", wraplength=340, justify="left")
+        feedback.pack(anchor="w", pady=(7, 4))
+        def save_meeting():
+            if not dlg.winfo_exists(): return
+            title = values["title"].get().strip()
+            if not title or len(title)>150:
+                feedback.configure(text="회의 제목은 1~150자로 입력해 주세요."); return
+            try:
+                start = datetime.strptime(values["date"].get().strip()+" "+values["time"].get().strip(), "%Y-%m-%d %H:%M")
+            except ValueError:
+                feedback.configure(text="날짜와 시간을 확인해 주세요. 예: 2026-11-17 / 14:30"); return
+            if start <= datetime.now():
+                feedback.configure(text="현재보다 이후의 회의 시작 시간을 입력해 주세요."); return
+            new_time = start.isoformat(timespec="minutes")
+            old_notified = bool(meeting and meeting.get("notified") and meeting.get("start_at")==new_time and meeting.get("remind_minutes")==remind.get())
+            data = {"id": meeting["id"] if meeting else uuid.uuid4().hex, "title": title,
+                    "start_at": new_time, "remind_minutes": remind.get(), "notified": old_notified}
+            if meeting: meeting.update(data)
+            else: self.state["meetings"].append(data)
+            self.save()
+            dlg.destroy()
+            self.render_meetings()
+            self.update_meeting_summary()
+            self.check_meetings()
+        self.btn(wrap, "회의 저장", save_meeting, width=318, height=42, fill="red", fg="on_accent", hover="red_dark").pack(fill="x", pady=(6, 0))
+        dlg.bind("<Return>", lambda e: save_meeting())
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+        widgets["title"].focus_set()
+
+    def delete_meeting(self, meeting):
+        if not messagebox.askyesno("회의 삭제", f"'{meeting['title']}' 일정을 삭제할까요?", parent=self.root): return
+        self.state["meetings"] = [m for m in self.state["meetings"] if m["id"] != meeting["id"]]
+        self.save()
+        self.render_meetings()
+        self.update_meeting_summary()
+
+    def check_meetings(self, now=None, meetings=None):
+        now = now or datetime.now()
+        if meetings is None:
+            meetings = self.upcoming_meetings(now)
+        self.meeting_popups = [w for w in self.meeting_popups if w.winfo_exists()]
+        changed = False
+        # Each due meeting gets its own alert, even if an earlier one is still open.
+        for meeting in meetings:
+            start = self.meeting_time(meeting)
+            if not meeting.get("notified") and start-timedelta(minutes=meeting["remind_minutes"]) <= now <= start:
+                self.show_meeting_alert(meeting, now)
+                meeting["notified"] = True
+                changed = True
+        if changed:
+            self.save()
+            self.render_meetings()
+
+    def meeting_tick(self):
+        self._meeting_after = None
+        if self._closing:return
+        try:
+            now = datetime.now()
+            meetings = self.upcoming_meetings(now)
+            self.check_meetings(now, meetings)
+            self.update_meeting_summary(now, meetings)
+            if self.meeting_list is not None:
+                key = (now.date(), tuple(m["id"] for m in meetings))
+                if key != self.meeting_view_key:
+                    self.render_meetings()
+        except Exception:
+            LOGGER.exception("Meeting tick failed; retrying")
+        finally:
+            if not self._closing:
+                # Reminder resolution: at most ~5 seconds of polling latency
+                # under normal load. No scanning/repainting five times a second.
+                self._meeting_after = self.root.after(5000, self.meeting_tick)
+
+    def show_meeting_alert(self, meeting, now):
+        start = self.meeting_time(meeting)
+        minutes = max(0, math.ceil((start-now).total_seconds()/60))
+        dlg = tk.Toplevel(self.root)
+        self.meeting_popups.append(dlg)
+        dlg.title("Tomato Focus · 회의 알림")
+        dlg.configure(bg=P["bg"])
+        dlg.resizable(False, False)
+        dlg.attributes("-topmost", True)
+        # Standalone, non-modal alert so it can appear over another application.
+        wrap = tk.Frame(dlg, bg=P["bg"], padx=20, pady=16)
+        wrap.pack(fill="both", expand=True)
+        head = tk.Frame(wrap, bg=P["bg"])
+        head.pack(fill="x")
+        icon = tk.Canvas(head, width=46, height=44, bg=P["bg"], highlightthickness=0)
+        icon.pack(side="left", padx=(0, 8))
+        draw_tomato(icon, 23, 27, 1.0)
+        self.label(head, f"회의 {minutes}분 전" if minutes else "회의 시작 시간", size=15, weight="bold", color="red").pack(side="left")
+        card = WhiteCard(wrap, padding=13)
+        card.pack(fill="x", pady=(8, 10))
+        self.label(card.body, meeting["title"], size=14, weight="bold", wraplength=320, justify="left", anchor="w").pack(fill="x")
+        self.label(card.body, f"{start:%Y.%m.%d} ({DAY_KO[start.weekday()]})  {start:%H:%M} 시작", size=10, color="muted").pack(anchor="w", pady=(5, 0))
+        self.label(wrap, "실행 중인 집중 타이머는 계속 진행됩니다.", size=9, color="muted").pack(anchor="w")
+        bar = tk.Frame(wrap, bg=P["bg"])
+        bar.pack(fill="x", pady=(12, 0))
+        def dismiss(open_schedule=False):
+            if dlg in self.meeting_popups: self.meeting_popups.remove(dlg)
+            dlg.destroy()
+            if open_schedule: self.open_meetings()
+        self.btn(bar, "일정 보기", lambda: dismiss(True), width=145, height=38, fill="white", border="line").pack(side="left", fill="x", expand=True, padx=(0, 7))
+        self.btn(bar, "확인", dismiss, width=145, height=38, fill="red", fg="on_accent").pack(side="left", fill="x", expand=True)
+        dlg.protocol("WM_DELETE_WINDOW", dismiss)
+        dlg.bind("<Escape>", lambda e: dismiss())
+        dlg.update_idletasks()
+        w, h = max(380, dlg.winfo_reqwidth()), dlg.winfo_reqheight()
+        offset = 32 * ((len(self.meeting_popups)-1) % 8)
+        x = max(0, dlg.winfo_screenwidth()-w-22-offset)
+        y = max(0, dlg.winfo_screenheight()-h-72-offset)
+        dlg.geometry(f"{w}x{h}+{x}+{y}")
+        dlg.lift()
+        try: self.root.bell()
+        except tk.TclError: pass
+
 
     # ───── Stats: week/month/year, chart, and activity map ─────
     def period_bounds(self):
@@ -1002,14 +1426,25 @@ class TomatoFocus:
         self.stats_info.pack(anchor="w",pady=(10,0))
 
     def stats_data(self):
-        days=self.period_days()
-        totals=self.date_totals()
-        vals=[totals.get(d.isoformat(),0) for d in days]
-        keyset={d.isoformat() for d in days}
-        sessions=[s for s in self.state["sessions"] if s.get("date") in keyset]
-        uninterrupt=[s for s in sessions if type(s.get("pause_count")) is int]
-        clean=round(sum(s["pause_count"]==0 for s in uninterrupt)*100/len(uninterrupt)) if uninterrupt else None
-        return days,vals,sessions,clean,totals
+        start, end = self.period_bounds()
+        cache_key = (start, end, self._session_revision)
+        if self._stats_cache is not None and self._stats_cache[0] == cache_key:
+            return self._stats_cache[1]
+        days = self.period_days()
+        totals = {}
+        count = known = clean_count = 0
+        for day in days:
+            key = day.isoformat()
+            minutes, n, k, c = self._daily_stats.get(key, (0, 0, 0, 0))
+            totals[key] = minutes
+            count += n
+            known += k
+            clean_count += c
+        vals = [totals[d.isoformat()] for d in days]
+        clean = round(clean_count * 100 / known) if known else None
+        result = (days, vals, count, clean, totals)
+        self._stats_cache = (cache_key, result)
+        return result
 
     def update_stats(self):
         if self.chart_canvas is None:return
@@ -1021,8 +1456,8 @@ class TomatoFocus:
         elif self.period=="month":caption=f"{start:%Y년 %m월}"
         else:caption=f"{start.year}년"
         self.period_caption.configure(text=caption)
-        days,vals,sessions,clean,_=self.stats_data()
-        overview={"total":sum(vals),"count":len(sessions),"days":sum(x>0 for x in vals),
+        days,vals,count,clean,_=self.stats_data()
+        overview={"total":sum(vals),"count":count,"days":sum(x>0 for x in vals),
                   "clean":"—" if clean is None else clean}
         for key,label in self.stats_summary.items():label.config(text=str(overview[key]))
         if vals and max(vals)>0:
@@ -1147,7 +1582,7 @@ class TomatoFocus:
     def settings_dialog(self):
         dlg=tk.Toplevel(self.root)
         dlg.title("Tomato Focus · 설정")
-        dlg.geometry("435x650")
+        dlg.geometry("435x690")
         dlg.resizable(False,False)
         dlg.configure(bg=P["bg"])
         dlg.transient(self.root)
@@ -1191,9 +1626,11 @@ class TomatoFocus:
         mini_pin=tk.BooleanVar(value=self.settings["mini_always_on_top"])
         main_pin=tk.BooleanVar(value=self.settings["always_on_top"])
         auto=tk.BooleanVar(value=self.settings["auto_break"])
+        sleep=tk.BooleanVar(value=self.settings["prevent_sleep"])
         for name,var in (("미니 위젯을 다른 창보다 항상 위에 표시",mini_pin),
                          ("메인 대시보드도 항상 위에 표시",main_pin),
-                         ("집중 완료 후 휴식 자동 시작",auto)):
+                         ("집중 완료 후 휴식 자동 시작",auto),
+                         ("실행 중 PC 자동 절전 방지 (Windows)",sleep)):
             tk.Checkbutton(wrap,text=name,variable=var,fg=P["text"],bg=P["bg"],
                            activebackground=P["bg"],activeforeground=P["red"],
                            selectcolor=P["white"],font=(self.font_name,10),
@@ -1212,6 +1649,8 @@ class TomatoFocus:
             self.settings["mini_always_on_top"]=bool(mini_pin.get())
             self.settings["always_on_top"]=bool(main_pin.get())
             self.settings["auto_break"]=bool(auto.get())
+            self.settings["prevent_sleep"]=bool(sleep.get())
+            self.apply_sleep_policy()
             self.remaining=max(1,self.settings[self.mode]*60-elapsed)
             self.focus_cycle%=self.settings["long_every"]
             self.status="설정이 저장됐어요."
@@ -1232,7 +1671,7 @@ class TomatoFocus:
         if was_changed:
             self.build()
             # Reassert the floating-widget stacking mode after reconfiguring its frame.
-            self.root.after_idle(self.apply_topmost)
+            self._schedule_topmost()
         self.save()
 
     def toggle_theme(self):
@@ -1267,6 +1706,36 @@ class TomatoFocus:
         except (tk.TclError,AttributeError,OSError,ValueError):
             pass
 
+    def _schedule_topmost(self):
+        self._cancel_after("_topmost_after")
+        if not self._closing:
+            self._topmost_after = self.root.after(150, self._reapply_topmost)
+
+    def _reapply_topmost(self):
+        self._topmost_after = None
+        if not self._closing:self.apply_topmost()
+
+    def apply_sleep_policy(self, release=False):
+        """Prevent Windows idle *system* sleep, not monitor sleep or lock.
+
+        Manual sleep, shutdown and forced termination remain under OS control.
+        The request is owned by this process and released during explicit exit.
+        """
+        if sys.platform != "win32":return
+        requested = bool(self.settings.get("prevent_sleep")) and not release
+        if requested == self._sleep_active:return
+        try:
+            set_state = ctypes.windll.kernel32.SetThreadExecutionState
+            set_state.argtypes = [ctypes.c_uint32]
+            set_state.restype = ctypes.c_uint32
+            flags = 0x80000000 | (0x00000001 if requested else 0)
+            if not set_state(flags):
+                LOGGER.warning("Windows rejected idle sleep request (enabled=%s)", requested)
+                return
+            self._sleep_active = requested
+        except (AttributeError, OSError):
+            LOGGER.exception("Unable to apply Windows sleep policy")
+
     def toggle_pin(self):
         self.settings["mini_always_on_top"]=not self.settings["mini_always_on_top"]
         self.apply_topmost()
@@ -1288,8 +1757,7 @@ class TomatoFocus:
             self.build()
             self.root.geometry(self.full_geometry)
             self.root.deiconify()
-        self.root.after(70,self.apply_topmost)
-        self.root.after(220,self.apply_topmost)
+        self._schedule_topmost()
 
     def start_drag(self,event):
         self.drag_start=(event.x_root-self.root.winfo_x(),event.y_root-self.root.winfo_y())
@@ -1333,12 +1801,34 @@ class TomatoFocus:
         except Exception as e:
             print("Preview capture failed:",e,file=sys.stderr)
         finally:
-            self.close()
+            # Explicit development-only --screenshot no longer terminates the app.
+            # Normal user sessions have no timed shutdown path.
+            LOGGER.info("Preview capture finished")
 
-    def close(self):
-        if self.compact:self.remember_mini_position()
-        self.save()
-        self.root.destroy()
+    def close(self, _event=None):
+        if self._closing:return "break"
+        if not messagebox.askyesno("Tomato Focus 종료",
+                "프로그램을 완전히 종료할까요?\n종료하면 회의 알림과 타이머가 중단됩니다.",
+                parent=self.root, default="no"):
+            return "break"
+        self.shutdown()
+        return "break"
+
+    def shutdown(self):
+        """Explicit exit only; save once and release callbacks and power request."""
+        if self._closing:return
+        self._closing = True
+        for attr in ("_tick_after", "_meeting_after", "_topmost_after"):
+            self._cancel_after(attr)
+        try:
+            if self.compact:
+                self.state.setdefault("window", {})["mini_x"] = self.root.winfo_x()
+                self.state["window"]["mini_y"] = self.root.winfo_y()
+            self.save()
+            LOGGER.info("Explicit shutdown")
+        finally:
+            self.apply_sleep_policy(release=True)
+            self.root.destroy()
 
 
 def main():
@@ -1347,10 +1837,17 @@ def main():
     parser.add_argument("--screenshot",default=None,help=argparse.SUPPRESS)
     parser.add_argument("--mini",action="store_true",help="Launch straight into floating widget")
     args=parser.parse_args()
-    root=tk.Tk()
-    app=TomatoFocus(root,demo=args.demo,screenshot=args.screenshot)
-    if args.mini:root.after(120,app.toggle_mini)
-    root.mainloop()
+    configure_logging()
+    try:
+        root=tk.Tk()
+        app=TomatoFocus(root,demo=args.demo,screenshot=args.screenshot)
+        if args.mini:root.after(120,app.toggle_mini)
+        root.mainloop()
+        if not app._closing:
+            LOGGER.warning("Main loop returned without explicit shutdown")
+    except Exception:
+        LOGGER.exception("Fatal application error")
+        raise
 
 
 if __name__=="__main__":
