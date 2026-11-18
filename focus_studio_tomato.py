@@ -28,7 +28,9 @@ import random
 import sys
 import time
 import tkinter as tk
-from tkinter import font as tkfont, messagebox
+from tkinter import font as tkfont, messagebox, simpledialog
+from statistics import median
+from difflib import SequenceMatcher
 import uuid
 
 APP_NAME = "Tomato Focus"
@@ -316,6 +318,11 @@ class TomatoFocus:
             self.add_demo_content()
         self.settings = self.state["settings"]
         self._daily_stats = {}
+        self._task_seconds = {}
+        self.session_task = None
+        self.segment_started = None
+        self.segment_budget = 0
+        self.session_seconds = 0
         for session in self.state["sessions"]:
             self._index_session(session)
         apply_palette(self.settings.get("theme", "light"))
@@ -334,9 +341,11 @@ class TomatoFocus:
         self.session_started = False
         self.status = "오늘의 작은 몰입을 시작해 보세요."
         self.active_task = self.state.get("active_task")
-        self.focus_cycle = sum(1 for s in self.state["sessions"] if s.get("date") == date.today().isoformat() and s.get("mode", "focus") == "focus") % self.settings["long_every"]
+        self.focus_cycle = sum(1 for s in self.state["sessions"] if s.get("date") == date.today().isoformat() and s.get("mode", "focus") == "focus" and not s.get("partial")) % self.settings["long_every"]
         self.filter_name = "all"
         self.summary_value = {}
+        self.advice_label = None
+        self._advice_widget = None
         self.timer_label = None
         self.primary_button = None
         self.mode_buttons = {}
@@ -362,7 +371,7 @@ class TomatoFocus:
         self.meeting_list = self.meeting_next = self.meeting_next_detail = None
         self.mini_meeting_label = None
         self.meeting_view_key = None
-        self.full_geometry = "1100x835"
+        self.full_geometry = "1100x930"
         self.root.title(APP_NAME)
         self.root.configure(bg=P["bg"])
         self.root.protocol("WM_DELETE_WINDOW", self.close)
@@ -388,7 +397,7 @@ class TomatoFocus:
     @staticmethod
     def fresh_state():
         return {"tasks": [], "sessions": [], "settings": dict(DEFAULT_SETTINGS),
-                "active_task": None, "window": {}, "meetings": []}
+                "active_task": None, "window": {}, "meetings": [], "breaks": [], "task_completion_log": []}
 
     def load(self):
         state = self.fresh_state()
@@ -398,6 +407,9 @@ class TomatoFocus:
                 return state
             state["tasks"] = [x for x in existing.get("tasks", []) if isinstance(x, dict)] if isinstance(existing.get("tasks", []), list) else []
             state["sessions"] = [x for x in existing.get("sessions", []) if isinstance(x, dict)] if isinstance(existing.get("sessions", []), list) else []
+            for key in ("breaks", "task_completion_log"):
+                if isinstance(existing.get(key), list):
+                    state[key] = [x for x in existing[key] if isinstance(x, dict)]
             meetings = existing.get("meetings", [])
             if isinstance(meetings, list):
                 for item in meetings:
@@ -474,6 +486,8 @@ class TomatoFocus:
         for child in self.root.winfo_children():
             if child not in self.meeting_popups and child is not self.break_popup: child.destroy()
         self.summary_value = {}
+        self.advice_label = None
+        self._advice_widget = None
         self.timer_label = self.primary_button = self.status_label = self.cycle_canvas = None
         self.scene = self.task_area = self.entry = self.task_scroll = None
         self.nav_buttons, self.mode_buttons, self.period_buttons = {}, {}, {}
@@ -544,6 +558,11 @@ class TomatoFocus:
         dt=datetime.now()
         self.label(top,"오늘도, 토마토 한 알만큼 집중해요.",size=19,weight="bold").pack(anchor="w")
         self.label(top,f"{dt:%Y.%m.%d}  ·  작고 꾸준한 몰입의 기록",size=10,color="muted").pack(anchor="w",pady=(3,0))
+        advice=WhiteCard(shell,padding=9)
+        advice.pack(fill="x",pady=(0,9))
+        self.label(advice.body,"🍅 오늘의 한마디 · 어제의 기록",size=10,color="red",weight="bold").pack(anchor="w")
+        self.advice_label=self.label(advice.body,self.daily_advice(),size=10,justify="left",wraplength=790)
+        self.advice_label.pack(anchor="w",pady=(3,0))
         summaries=tk.Frame(shell,bg=P["bg"],height=94)
         summaries.pack(fill="x",pady=(0,13))
         summaries.pack_propagate(False)
@@ -728,6 +747,25 @@ class TomatoFocus:
             self.entry.insert(0,"할 일을 입력해 주세요")
             self.entry.configure(fg=P["hint"])
 
+    def task_prediction(self, title, category):
+        matches = []
+        for t in self.state['tasks']:
+            if not t.get('done') or not self._task_seconds.get(t.get('id')): continue
+            if t.get('tracking_incomplete'): continue
+            ratio = SequenceMatcher(None, title.casefold().strip(), str(t.get('title','')).casefold().strip()).ratio()
+            if ratio >= .65 or (category.strip() and category.casefold().strip() == str(t.get('category','')).casefold().strip()):
+                matches.append(self._task_seconds[t['id']]/60)
+        return (round(median(matches)), len(matches)) if matches else (0,0)
+
+    def task_info(self, t):
+        actual = self._task_seconds.get(t.get('id'),0)/60
+        est = self.mins(t.get('estimate_minutes'))
+        text = f"실제 {actual:.1f}분"
+        if est:
+            diff = actual-est
+            text += f" / 예상 {est}분 · " + (f"{abs(diff):.1f}분 초과" if diff>0 else (f"{abs(diff):.1f}분 단축" if t.get('done') else f"{abs(diff):.1f}분 여유"))
+        return text
+
     def add_task(self):
         if not self.entry:return
         title=self.entry.get().strip()
@@ -735,9 +773,15 @@ class TomatoFocus:
         if len(title)>180:
             messagebox.showwarning("할 일 추가","할 일은 180자 이하로 입력해 주세요.",parent=self.root)
             return
+        category = simpledialog.askstring("업무 분류", "업무 카테고리 (예: 보고서, 개발, 분석)", parent=self.root)
+        if category is None: return
+        predicted, count = self.task_prediction(title, category)
+        hint = f"\n유사 업무 {count}건의 중앙값: {predicted}분" if count else "\n추천에 필요한 완료 기록이 아직 없습니다."
+        estimate = simpledialog.askinteger("예상 소요 시간", "예상 집중 시간 (분)"+hint, initialvalue=max(1,predicted or 25), minvalue=1, maxvalue=100000, parent=self.root)
+        if estimate is None: return
         self.state["tasks"].insert(0,{"id":uuid.uuid4().hex[:12],"title":title,"done":False,
                                        "priority":False,"created_at":date.today().isoformat(),
-                                       "completed_on":None})
+                                       "completed_on":None,"category":category.strip(),"estimate_minutes":estimate})
         self.entry.delete(0,"end")
         self.entry_blur()
         self.root.focus_set()
@@ -751,8 +795,16 @@ class TomatoFocus:
     def toggle_task(self,task_id):
         t=self.get_task(task_id)
         if not t:return
+        if self.session_started and self.mode == "focus" and self.session_task == task_id:
+            self.record_partial()
+            self.reset_timer()
         t["done"]=not t.get("done",False)
         t["completed_on"]=date.today().isoformat() if t["done"] else None
+        if t["done"]:
+            self.state["task_completion_log"].append({"date":t["completed_on"],"task_id":task_id,
+                "estimate_minutes":self.mins(t.get("estimate_minutes")),"seconds":self._task_seconds.get(task_id,0)})
+        else:
+            self.state["task_completion_log"]=[r for r in self.state["task_completion_log"] if r.get("task_id")!=task_id or r.get("date")!=date.today().isoformat()]
         if t["done"] and self.active_task==task_id:self.active_task=None
         self.save();self.refresh()
 
@@ -762,11 +814,14 @@ class TomatoFocus:
 
     def choose_task(self,task_id):
         t=self.get_task(task_id)
+        if self.mode == "focus" and self.session_started:
+            messagebox.showinfo("집중 중", "현재 세션을 완료하거나 초기화한 뒤 선택해 주세요.", parent=self.root); return
         if t and not t.get("done"):
             self.active_task = None if self.active_task==task_id else task_id
             self.save();self.refresh()
 
     def delete_task(self,task_id):
+        if self.session_started and self.session_task == task_id: return
         self.state["tasks"]=[t for t in self.state["tasks"] if t.get("id")!=task_id]
         if self.active_task==task_id:self.active_task=None
         self.save();self.refresh()
@@ -783,7 +838,7 @@ class TomatoFocus:
         if self.task_area is None:return
         # Rebuild only when task data, selection or filter actually changes.
         key=(self.filter_name, self.active_task, tuple(
-            (t.get("id"), t.get("title"), bool(t.get("done")), bool(t.get("priority")))
+            (t.get("id"), t.get("title"), bool(t.get("done")), bool(t.get("priority")), self._task_seconds.get(t.get("id"),0), t.get("estimate_minutes"))
             for t in self.state["tasks"]))
         if key == self._task_render_key:return
         self._task_render_key=key
@@ -791,7 +846,7 @@ class TomatoFocus:
         for key,button in self.task_filter_buttons.items():
             on=key==self.filter_name
             button.set(fill="red_pale" if on else "white",fg="red" if on else "muted")
-        items=sorted(self.state["tasks"],key=lambda t:(bool(t.get("done")),not bool(t.get("priority"))))
+        items=sorted(self.state["tasks"],key=lambda t:(bool(t.get("done")),not bool(t.get("priority")), self._task_seconds.get(t.get("id"),0), t.get("estimate_minutes")))
         if self.filter_name=="active":items=[x for x in items if not x.get("done")]
         if self.filter_name=="done":items=[x for x in items if x.get("done")]
         self.task_count.configure(text=f"{sum(not x.get('done') for x in self.state['tasks'])}개 진행 중")
@@ -808,7 +863,7 @@ class TomatoFocus:
             r.pack(fill="x",pady=(0,7),padx=(0,4))
             self.btn(r,"✓" if done else "○",lambda i=tid:self.toggle_task(i),
                      width=35,height=31,fill=bg,fg="green" if done else "muted",size=14).pack(side="left")
-            text=self.label(r,t.get("title","제목 없음"),size=10,color="hint" if done else "text",
+            text=self.label(r,t.get("title","제목 없음")+"\n"+self.task_info(t),size=10,color="hint" if done else "text",
                             bg=bg,anchor="w",cursor="hand2")
             text.pack(side="left",fill="x",expand=True,padx=(3,1))
             if done:
@@ -842,6 +897,10 @@ class TomatoFocus:
         except (ValueError, TypeError):
             return
         agg = self._daily_stats.setdefault(key, [0, 0, 0, 0])
+        tid = session.get("task_id")
+        seconds = self.mins(session.get("seconds", self.mins(session.get("minutes"))*60))
+        if tid: self._task_seconds[tid] = self._task_seconds.get(tid,0)+seconds
+        if session.get("partial"): return
         agg[0] += self.mins(session.get("minutes", 0))
         agg[1] += 1
         if type(session.get("pause_count")) is int:
@@ -857,7 +916,37 @@ class TomatoFocus:
         agg = self._daily_stats.get(date.today().isoformat(), (0, 0, 0, 0))
         return agg[0], agg[1]
 
+    def daily_advice(self, today=None):
+        yesterday=((today or date.today())-timedelta(days=1)).isoformat()
+        records=[r for r in self.state.get("task_completion_log",[]) if r.get("date")==yesterday]
+        ids={r.get("task_id") for r in records}
+        records += [{"task_id":t.get("id"),"estimate_minutes":t.get("estimate_minutes"),"seconds":self._task_seconds.get(t.get("id"),0)} for t in self.state["tasks"] if t.get("completed_on")==yesterday and t.get("id") not in ids]
+        comparable=[r for r in records if self.mins(r.get("estimate_minutes")) and self.mins(r.get("seconds"))]
+        early=sum(self.mins(r.get("seconds")) < self.mins(r.get("estimate_minutes"))*60 for r in comparable)
+        late=sum(self.mins(r.get("seconds")) > self.mins(r.get("estimate_minutes"))*60 for r in comparable)
+        focus=sum(self.mins(r.get("seconds",self.mins(r.get("minutes"))*60)) for r in self.state["sessions"] if r.get("date")==yesterday and r.get("mode","focus")=="focus")
+        breaks=[r for r in self.state.get("breaks",[]) if r.get("date")==yesterday]
+        rest=sum(self.mins(r.get("seconds")) for r in breaks)
+        if not (records or focus or breaks): return "어제 기록이 없어요. 오늘은 중요한 업무 하나를 선택하고 예상 시간을 설정해 보세요."
+        summary=f"완료 {len(records)}건 · 조기 {early}건 · 초과 {late}건 · 집중 {focus/60:.0f}분 · 휴식 "+(f"{rest/60:.0f}분" if breaks else "기록 없음")
+        if late and late>=early:
+            ratios=[self.mins(r.get("seconds"))/(60*self.mins(r.get("estimate_minutes"))) for r in comparable if self.mins(r.get("seconds"))>60*self.mins(r.get("estimate_minutes"))]
+            extra=min(100,max(10,round((median(ratios)-1)*100)))
+            tip=f"비슷한 업무에는 예상 시간을 약 {extra}% 넉넉히 잡고, 큰 업무는 작은 단계로 나눠 보세요."
+        elif early: tip="예상보다 빠르게 끝낸 업무가 있어요. 유사 업무의 예상 시간을 실제 기록에 맞춰 조정해 보세요."
+        elif not records: tip="오늘은 진행 중인 중요한 업무 하나를 먼저 완료해 보세요."
+        else: tip="오늘도 예상 시간과 실제 시간을 비교하며 업무를 진행해 보세요."
+        if focus and not breaks: tip += " 휴식 기록이 없어 오늘은 휴식 타이머도 사용해 보세요."
+        elif focus and rest/focus < 0.15: tip += " 기록상 휴식이 짧았으니 세션 사이에 충분히 쉬어 주세요."
+        return summary+"\n"+tip
+
     def refresh(self):
+        if getattr(self,"advice_label",None) is not None:
+            day=date.today()
+            if getattr(self,"_advice_day",None)!=day or getattr(self,"_advice_widget",None) is not self.advice_label:
+                self.advice_label.config(text=self.daily_advice(day))
+                self._advice_day=day
+                self._advice_widget=self.advice_label
         if self.timer_label is not None:
             sec=max(0,int(self.remaining))
             self.timer_label.config(text=f"{sec//60:02d}:{sec%60:02d}")
@@ -899,7 +988,11 @@ class TomatoFocus:
             self.pause_since=None
         if not self.session_started:
             self.session_started=True
+            self.session_task=self.active_task if self.mode=="focus" else None
+            self.session_seconds=0
             self.focus_started_at=datetime.now().isoformat(timespec="seconds")
+        self.segment_started=time.monotonic()
+        self.segment_budget=self.remaining
         self.running=True
         self.deadline=time.monotonic()+self.remaining
         self._schedule_tick()
@@ -908,6 +1001,7 @@ class TomatoFocus:
 
     def pause_timer(self):
         if not self.running:return
+        self.capture_segment()
         self.remaining=max(0,math.ceil(self.deadline-time.monotonic()))
         self.running=False
         self.deadline=None
@@ -916,7 +1010,38 @@ class TomatoFocus:
         self.status="잠시 멈췄어요. 다시 이어서 할 수 있어요."
         self.refresh()
 
+    def capture_segment(self):
+        if self.segment_started is not None:
+            self.session_seconds += min(self.segment_budget, max(0,time.monotonic()-self.segment_started))
+            self.segment_started = None
+
+    def record_break(self):
+        if self.mode not in ("short", "long") or not self.session_started: return
+        self.capture_segment()
+        seconds=round(self.session_seconds)
+        if seconds:
+            self.state["breaks"].append({"date":date.today().isoformat(),"seconds":seconds,"mode":self.mode})
+        self.session_seconds=0
+        self.save()
+
+    def record_partial(self):
+        if self.mode != "focus":
+            self.record_break()
+            return
+        if self.mode != "focus" or not self.session_started or not self.session_task: return
+        self.capture_segment()
+        seconds=round(self.session_seconds)
+        if seconds:
+            t=self.get_task(self.session_task)
+            record={"date":date.today().isoformat(),"minutes":0,"seconds":seconds,"partial":True,"mode":"focus","task_id":self.session_task,"task_title":t.get("title","") if t else ""}
+            self.state["sessions"].append(record); self._index_session(record)
+        self.session_seconds=0
+        self.save()
+
     def reset_session_meta(self):
+        self.session_task=None
+        self.segment_started=None
+        self.session_seconds=0
         self.pause_count=0
         self.pause_total=0
         self.pause_since=None
@@ -924,6 +1049,7 @@ class TomatoFocus:
         self.session_started=False
 
     def reset_timer(self):
+        self.record_partial()
         self.running=False
         self.deadline=None
         self.remaining=60*self.settings[self.mode]
@@ -933,6 +1059,7 @@ class TomatoFocus:
 
     def switch_mode(self,mode):
         if mode not in MODE_TITLE:return
+        self.record_partial()
         self.mode=mode
         self.running=False
         self.deadline=None
@@ -945,10 +1072,11 @@ class TomatoFocus:
         # A skipped focus session is not added to statistics.
         target="short" if self.mode=="focus" else "focus"
         self.switch_mode(target)
-        self.status="다음 단계로 넘어갔어요. 건너뛴 시간은 기록하지 않아요."
+        self.status="다음 단계로 넘어갔어요. 완료 세션 통계에는 반영하지 않아요."
         self.refresh()
 
     def finish_session(self):
+        self.capture_segment()
         old=self.mode
         self.running=False
         self.deadline=None
@@ -957,8 +1085,9 @@ class TomatoFocus:
                 "date":date.today().isoformat(),
                 "minutes":self.settings["focus"],
                 "mode":"focus",
-                "task_id":self.active_task,
+                "task_id":self.session_task,
                 "task_title":self.active_task_title(),
+                "seconds":round(self.session_seconds),
                 "started_at":self.focus_started_at,
                 "finished_at":datetime.now().isoformat(timespec="seconds"),
                 "pause_count":self.pause_count,
@@ -973,6 +1102,7 @@ class TomatoFocus:
             else:self.mode="short"
             self.status="토마토 수확 완료! 휴식할 시간이 왔어요."
         else:
+            self.record_break()
             self.mode="focus"
             self.status="휴식 끝! 다시 한 번 시작해 볼까요?"
         self.reset_session_meta()
@@ -1904,6 +2034,7 @@ class TomatoFocus:
             if self.compact:
                 self.state.setdefault("window", {})["mini_x"] = self.root.winfo_x()
                 self.state["window"]["mini_y"] = self.root.winfo_y()
+            self.record_partial()
             self.save()
             LOGGER.info("Explicit shutdown")
         finally:
