@@ -331,6 +331,11 @@ class TomatoFocus:
         self.period = "week"
         self.anchor_day = date.today()
         self.compact = False
+        self.buddy = False
+        self.buddy_canvas = None
+        self.buddy_kind = "time"
+        self.buddy_next = 0
+        self.buddy_last_text = None
         self.running = False
         self.remaining = self.settings["focus"] * 60
         self.deadline = None
@@ -504,8 +509,14 @@ class TomatoFocus:
 
     def build(self):
         self.clear_widgets()
+        self.buddy_canvas = None
+        if sys.platform == "win32":
+            try: self.root.attributes("-transparentcolor", "")
+            except tk.TclError: pass
         self.root.configure(bg=P["bg"])
-        if self.compact:
+        if self.buddy:
+            self.build_buddy()
+        elif self.compact:
             self.build_mini()
         else:
             self.build_full()
@@ -618,6 +629,7 @@ class TomatoFocus:
         self.btn(header,"↗",self.toggle_mini,width=30,height=28,fill="white",fg="muted",size=13).pack(side="right",padx=(0,1))
         self.btn(header,"☾" if self.settings["theme"] == "light" else "☀",
                  self.toggle_theme,width=27,height=28,fill="surface",fg="text",size=11).pack(side="right",padx=(0,3))
+        self.btn(header,"●",self.toggle_buddy,width=25,height=27,fill="surface",fg="red",size=10).pack(side="right",padx=(0,2))
         self.mini_pin=self.btn(header,"고정",self.toggle_pin,width=43,height=27,
                               fill="red_pale",fg="red",size=9)
         self.mini_pin.pack(side="right",padx=(0,3))
@@ -631,6 +643,91 @@ class TomatoFocus:
         self.mini_meeting_label = self.label(panel, "", size=9, color="red", anchor="center", cursor="hand2")
         self.mini_meeting_label.pack(fill="x", pady=(4,0))
         self.mini_meeting_label.bind("<Button-1>", self.open_meetings)
+
+    def build_buddy(self):
+        self.root.overrideredirect(True)
+        self.root.resizable(False, False)
+        self.root.minsize(1, 1)
+        bg = "#010203" if sys.platform == "win32" else P["bg"]
+        self.root.configure(bg=bg)
+        if sys.platform == "win32":
+            try: self.root.attributes("-transparentcolor", bg)
+            except tk.TclError: pass
+        w,h=280,205
+        right,bottom=self.root.winfo_screenwidth(),self.root.winfo_screenheight()
+        if sys.platform == "win32":
+            try:
+                from ctypes import wintypes
+                rect=wintypes.RECT()
+                if ctypes.windll.user32.SystemParametersInfoW(48,0,ctypes.byref(rect),0):
+                    right,bottom=rect.right,rect.bottom
+            except (AttributeError,OSError): pass
+        self.root.geometry(f"{w}x{h}+{max(0,right-w-12)}+{max(0,bottom-h-12)}")
+        c=self.buddy_canvas=tk.Canvas(self.root,width=w,height=h,bg=bg,highlightthickness=0)
+        c.pack(fill="both",expand=True)
+        c.create_rectangle(8,8,267,112,fill=P["white"],outline=P["line"],width=1)
+        c.create_polygon(209,111,236,127,244,111,fill=P["white"],outline=P["line"])
+        c.create_line(210,111,243,111,fill=P["white"],width=2)
+        c.create_text(20,22,anchor="w",text="TOMATO BUDDY",fill=P["red"],font=(self.font_name,9,"bold"))
+        self.buddy_text=c.create_text(20,58,anchor="w",width=235,fill=P["text"],font=(self.font_name,10),text="")
+        c.create_text(20,96,anchor="w",text="클릭: 다음 말 · 더블클릭: 복귀",fill=P["muted"],font=(self.font_name,8))
+        c.create_line(218,181,215,197,fill="#75483b",width=4,capstyle="round")
+        c.create_line(244,181,247,197,fill="#75483b",width=4,capstyle="round")
+        c.create_line(205,160,195,173,fill="#75483b",width=4,capstyle="round")
+        c.create_line(256,160,266,173,fill="#75483b",width=4,capstyle="round")
+        draw_tomato(c,231,159,1.65,speckles=False)
+        for x in (221,241): c.create_oval(x-2,161,x+2,165,fill="#442a25",outline="")
+        c.create_arc(226,165,236,174,start=200,extent=140,style="arc",outline="#442a25",width=2)
+        c.bind("<Button-1>",lambda e:self.update_buddy(force=True))
+        c.bind("<Double-Button-1>",lambda e:self.toggle_buddy())
+        menu=tk.Menu(c,tearoff=False)
+        menu.add_command(label="미니 위젯 복귀",command=self.toggle_buddy)
+        menu.add_command(label="시작 / 일시정지",command=self.toggle_timer)
+        menu.add_command(label="다음 메시지",command=lambda:self.update_buddy(force=True))
+        menu.add_command(label="종료",command=self.close)
+        c.bind("<Button-3>",lambda e:menu.tk_popup(e.x_root,e.y_root))
+        self.buddy_last_text=None
+        self.update_buddy()
+
+    def update_buddy(self, force=False):
+        if not self.buddy or self.buddy_canvas is None:return
+        now=time.monotonic()
+        if force or now>=self.buddy_next:
+            kinds=["time","task","cheer","progress"]
+            if self.running and self.mode=="focus": kinds.append("attack")
+            if self.mode!="focus": kinds.append("break")
+            self.buddy_kind=random.choice([k for k in kinds if k!=self.buddy_kind] or kinds) if self.buddy_next else "time"
+            self.buddy_next=now+45
+            self.buddy_cheer=random.choice(["한 번에 하나씩, 충분히 잘하고 있어요!","작은 집중이 큰 결과를 만들어요.","오늘도 토마토 한 알씩 모아봐요!"])
+        sec=max(0,int(self.remaining))
+        clock=f"{sec//60:02d}:{sec%60:02d}"
+        task=self.get_task(self.session_task if self.session_started else self.active_task)
+        name=str(task.get("title", ""))[:45] if task else "미선택"
+        mode="집중" if self.mode=="focus" else "휴식"
+        kind=self.buddy_kind
+        if kind=="attack" and (not self.running or self.mode!="focus"):kind="time"
+        if kind=="break" and self.mode=="focus":kind="time"
+        text={"time":f"{mode} {'남은 시간' if self.running else '대기 / 정지'} · {clock}",
+              "task":f"{'집중할 일' if self.mode=='focus' else '휴식 후 할 일'}: {name}",
+              "cheer":getattr(self,"buddy_cheer","오늘도 힘내요!"),
+              "attack":f"타임 어택! 다음 {min(5,max(1,math.ceil(sec/60)))}분은 이 일에만 집중! 남은 {clock}",
+              "break":"물 한 잔과 가벼운 스트레칭 어때요?"}.get(kind)
+        if kind=="progress":
+            mins,count=self.today_totals()
+            text=f"오늘 완료한 토마토 {count}개 · 집중 {mins}분!"
+        if text!=self.buddy_last_text:
+            self.buddy_canvas.itemconfigure(self.buddy_text,text=text)
+            self.buddy_last_text=text
+
+    def toggle_buddy(self):
+        if not self.compact:return
+        if not self.buddy:self.remember_mini_position()
+        self.buddy=not self.buddy
+        self.buddy_next=0
+        self.root.withdraw()
+        self.build()
+        self.root.deiconify()
+        self._schedule_topmost()
 
     def build_timer(self, parent,mini):
         modebar=tk.Frame(parent,bg=parent.cget("bg"))
@@ -945,6 +1042,7 @@ class TomatoFocus:
         return summary+"\n"+tip
 
     def refresh(self):
+        self.update_buddy()
         if getattr(self,"advice_label",None) is not None:
             day=date.today()
             if getattr(self,"_advice_day",None)!=day or getattr(self,"_advice_widget",None) is not self.advice_label:
@@ -1232,6 +1330,7 @@ class TomatoFocus:
                         self.timer_label.config(text=f"{new//60:02d}:{new%60:02d}")
                 if self.remaining==0:
                     self.finish_session()
+            self.update_buddy()
         except Exception:
             LOGGER.exception("Timer tick failed; retrying")
         finally:
@@ -1387,6 +1486,7 @@ class TomatoFocus:
             self.mini_meeting_label.configure(text=mini)
 
     def open_meetings(self, _event=None):
+        if self.buddy: self.toggle_buddy()
         if self.compact: self.toggle_mini()
         self.switch_page("meetings")
         return "break"
@@ -1892,6 +1992,7 @@ class TomatoFocus:
         self.set_theme("dark" if self.settings.get("theme") == "light" else "light")
 
     def topmost_enabled(self):
+        if self.buddy:return True
         return bool(self.settings["mini_always_on_top"] if self.compact else self.settings["always_on_top"])
 
     def apply_topmost(self):
@@ -1957,6 +2058,9 @@ class TomatoFocus:
         self.refresh()
 
     def toggle_mini(self):
+        if self.buddy:
+            self.toggle_buddy()
+            return
         if not self.compact:
             self.full_geometry=self.root.geometry()
             self.compact=True
@@ -1994,6 +2098,7 @@ class TomatoFocus:
         self.drag_start=None
 
     def quick_add(self,_event=None):
+        if self.buddy:self.toggle_buddy()
         if self.compact:self.toggle_mini()
         if self.page!="focus":self.switch_page("focus")
         if self.entry:self.entry.focus_set();self.entry_focus()
@@ -2035,7 +2140,7 @@ class TomatoFocus:
         for attr in ("_tick_after", "_meeting_after", "_topmost_after"):
             self._cancel_after(attr)
         try:
-            if self.compact:
+            if self.compact and not self.buddy:
                 self.state.setdefault("window", {})["mini_x"] = self.root.winfo_x()
                 self.state["window"]["mini_y"] = self.root.winfo_y()
             self.record_partial()
