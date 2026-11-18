@@ -123,16 +123,16 @@ Python 3.9+ · Tkinter · Windows EXE 배포 지원 · Light / Dark</br>
 Python으로 실행</br>
 
 프로젝트 폴더에서 다음 명령어를 실행합니다.</br>
+```python focus_studio_tomato.py```
 
-’’’python focus_studio_tomato.py’’’
 
 미니 위젯으로 바로 시작하려면:</br>
 
-’’’python focus_studio_tomato.py --mini’’’
+```python focus_studio_tomato.py --mini```
 
 기능 확인용 샘플 데이터로 실행하려면:</br>
 
-’’’python focus_studio_tomato.py --demo’’’
+```python focus_studio_tomato.py --demo```
 
 --demo는 예시 할 일과 집중 기록을 메모리에 표시하며, 해당 실행에서 데이터 파일을 저장하지 않습니다.</br>
 </br>
@@ -140,19 +140,19 @@ Python으로 실행</br>
 
 1. PyInstaller 설치</br>
 
-’’’python -m pip install pyinstaller’’’
+```python -m pip install pyinstaller```
 
 2. 실행 파일 생성</br>
 
-’’’python -m PyInstaller --noconfirm --clean --onefile --windowed --name TomatoFocus focus_studio_tomato.py’’’
+```python -m PyInstaller --noconfirm --clean --onefile --windowed --name TomatoFocus focus_studio_tomato.py```
 
 3. 실행</br>
 
-’’’.\dist\TomatoFocus.exe’’’
+```.\dist\TomatoFocus.exe```
 
 미니 위젯으로 바로 실행하려면:</br>
 
-’’’.\dist\TomatoFocus.exe --mini’’’
+```.\dist\TomatoFocus.exe --mini```
 
 생성 파일은 dist/TomatoFocus.exe에 있습니다. --windowed는 콘솔 창을 숨기고, --onefile은 실행 파일 하나로 패키징합니다. 일반적인 실행에는 별도 그림 파일이나 데이터 파일을 EXE에 포함할 필요가 없습니다.</br>
 
@@ -204,11 +204,11 @@ Python으로 실행</br>
 
 할 일, 완료 세션, 회의 일정 및 알림 상태, 테마, 설정 및 미니 위젯 위치는 로컬 JSON 파일에 저장됩니다.</br>
 
-’’’~/.focus_studio/state.json’’’
+```~/.focus_studio/state.json```
 
 Windows의 일반적인 위치:</br>
 
-’’’C:\Users\<사용자명>\.focus_studio\state.json’’’
+```C:\Users\<사용자명>\.focus_studio\state.json```
 
 • 클라우드 계정이나 서버 없이 로컬 저장합니다.</br>
 • 기존 Focus Studio의 state.json과 데이터 형식을 호환하도록 작성했습니다.</br>
@@ -217,7 +217,7 @@ Windows의 일반적인 위치:</br>
 • 데이터 파일을 삭제하면 저장된 기록이 사라지므로 주의하세요.</br>
 </br>
 📁 프로젝트 구조</br>
-’’’
+```
 TomatoFocus/
 ├── README.md
 ├── focus_studio_tomato.py
@@ -227,7 +227,7 @@ TomatoFocus/
         ├── focus-dark.png
         ├── mini-widget-dark.png
         └── statistics-year.png
-’’’
+```
 코드 실행에 필수인 파일은 focus_studio_tomato.py 하나입니다. docs/screenshots는 GitHub README에 이미지를 보여주기 위한 폴더입니다.</br>
 
 🔧 자주 묻는 질문</br>
