@@ -18,11 +18,11 @@ Tkinter로 만든 가벼운 데스크톱 뽀모도로 타이머<br>
 
 |☀️ 라이트 모드                                                                  |🌙 다크 모드                                                                 |
 |:------------------------------------------------------------------------:|:----------------------------------------------------------------------:|
-|<img src="docs/screenshots/focus-light.png" alt="라이트 모드 대시보드" width="470">|<img src="docs/screenshots/focus-dark.png" alt="다크 모드 대시보드" width="470">|
+|<img src="docs/focus-light.png" alt="라이트 모드 대시보드" width="470">|<img src="docs/focus-dark.png" alt="다크 모드 대시보드" width="470">|
 
 |📌 미니 위젯 (다크 모드)                                                                     |📊 연간 통계                                                                           |
 |:----------------------------------------------------------------------------------:|:--------------------------------------------------------------------------------:|
-|<img src="docs/screenshots/mini-widget-dark.png" alt="항상 위에 표시되는 미니 위젯" width="300">|<img src="docs/screenshots/statistics-year.png" alt="연간 집중 시간과 활동 지도" width="470">|
+|<img src="docs/mini-widget-dark.png" alt="항상 위에 표시되는 미니 위젯" width="300">|<img src="docs/statistics-year.png" alt="연간 집중 시간과 활동 지도" width="470">|
 
 > 스크린샷에는 기능 확인을 위해 만든 **예시 데이터**가 포함되어 있습니다. 기존 버전 화면이므로 최신 업무 추적·오늘의 한마디 UI와 일부 다를 수 있습니다. 실제 기록은 사용자 로컬 파일에서 불러옵니다.
 
