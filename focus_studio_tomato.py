@@ -841,17 +841,20 @@ class TomatoFocus:
             (t.get("id"), t.get("title"), bool(t.get("done")), bool(t.get("priority")), self._task_seconds.get(t.get("id"),0), t.get("estimate_minutes"))
             for t in self.state["tasks"]))
         if key == self._task_render_key:return
-        self._task_render_key=key
-        for child in self.task_area.winfo_children():child.destroy()
-        for key,button in self.task_filter_buttons.items():
-            on=key==self.filter_name
-            button.set(fill="red_pale" if on else "white",fg="red" if on else "muted")
-        items=sorted(self.state["tasks"],key=lambda t:(bool(t.get("done")),not bool(t.get("priority")), self._task_seconds.get(t.get("id"),0), t.get("estimate_minutes")))
+        # Normalize legacy estimates before sorting or clearing the visible list.
+        items=sorted(self.state["tasks"],key=lambda t:(bool(t.get("done")),not bool(t.get("priority")), self.mins(self._task_seconds.get(t.get("id"),0)), self.mins(t.get("estimate_minutes"))))
         if self.filter_name=="active":items=[x for x in items if not x.get("done")]
         if self.filter_name=="done":items=[x for x in items if x.get("done")]
+        self._task_render_key=None
+        for child in self.task_area.winfo_children():child.destroy()
+        for filter_key,button in self.task_filter_buttons.items():
+            on=filter_key==self.filter_name
+            button.set(fill="red_pale" if on else "white",fg="red" if on else "muted")
         self.task_count.configure(text=f"{sum(not x.get('done') for x in self.state['tasks'])}개 진행 중")
         if not items:
             self.label(self.task_area,"할 일이 없어요. 첫 번째 토마토를 심어볼까요?",size=10,color="muted").pack(pady=35)
+            self.task_scroll.configure(scrollregion=self.task_scroll.bbox("all"))
+            self._task_render_key=key
             return
         for t in items:
             tid=t.get("id")
@@ -877,6 +880,7 @@ class TomatoFocus:
                 widget.bind("<MouseWheel>",self.mouse_scroll)
         self.task_area.update_idletasks()
         self.task_scroll.configure(scrollregion=self.task_scroll.bbox("all"))
+        self._task_render_key=key
 
     def active_task_title(self):
         obj=self.get_task(self.active_task)
@@ -886,7 +890,7 @@ class TomatoFocus:
     def mins(value):
         try:
             return max(0,int(value))
-        except (ValueError,TypeError):
+        except (ValueError,TypeError,OverflowError):
             return 0
 
     def _index_session(self, session):
